@@ -1,101 +1,134 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import time
-import requests
-from qCloud import QcloudApiv3
+"""
+DNSPod DNS updater.
+Updates DNSPod (Tencent Cloud) DNS records with the latest optimized IPs.
+"""
+
 import traceback
-import os
-import json
+from typing import List, Dict, Any, Optional
 
-# 域名和子域名
-DOMAIN = os.environ['DOMAIN']
-SUB_DOMAIN = os.environ['SUB_DOMAIN']
+import requests
 
-# API 密钥
-SECRETID = os.environ["SECRETID"]
-SECRETKEY = os.environ["SECRETKEY"]
-
-# pushplus_token
-PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
-
-
-def get_cf_speed_test_ip(timeout=10, max_retries=5):
-    for attempt in range(max_retries):
-        try:
-            # 发送 GET 请求，设置超时
-            response = requests.get('https://ip.164746.xyz/ipTop.html', timeout=timeout)
-
-            # 检查响应状态码
-            if response.status_code == 200:
-                return response.text
-        except Exception as e:
-            traceback.print_exc()
-            print(f"get_cf_speed_test_ip Request failed (attempt {attempt + 1}/{max_retries}): {e}")
-    # 如果所有尝试都失败，返回 None 或者抛出异常，根据需要进行处理
-    return None
+from common import (
+    get_env_var,
+    get_cf_speed_test_ip,
+    pushplus_send,
+    format_current_time,
+    log_success,
+    log_error,
+    DEFAULT_TIMEOUT,
+)
+from qCloud import QcloudApiv3
 
 
-def build_info(cloud):
+def build_dns_info(cloud: QcloudApiv3, domain: str, sub_domain: str) -> List[Dict[str, Any]]:
+    """
+    Build DNS record information from DNSPod.
+
+    Args:
+        cloud: QcloudApiv3 instance
+        domain: Domain name
+        sub_domain: Subdomain name
+
+    Returns:
+        List of record info dicts with 'recordId' and 'value' keys
+    """
+    def_info = []
+
     try:
-        ret = cloud.get_record(DOMAIN, 100, SUB_DOMAIN, 'A')
-        def_info = []
-        for record in ret["data"]["records"]:
-            info = {"recordId": record["id"], "value": record["value"]}
-            if record["line"] == "默认":
-                def_info.append(info)
-        print(f"build_info success: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- ip：" + str(def_info))
-        return def_info
+        ret = cloud.get_record(domain, 100, sub_domain, "A")
+        for record in ret.get("data", {}).get("records", []):
+            if record.get("line") == "默认":
+                def_info.append({
+                    "recordId": record.get("id"),
+                    "value": record.get("value")
+                })
+        log_success("build_info", str(def_info))
     except Exception as e:
         traceback.print_exc()
-        print(f"build_info ERROR: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- MESSAGE: " + str(e))
+        log_error("build_info", str(e))
+
+    return def_info
 
 
-def change_dns(cloud, record_id, cf_ip):
+def change_dns(
+    cloud: QcloudApiv3,
+    domain: str,
+    sub_domain: str,
+    record_id: int,
+    cf_ip: str
+) -> str:
+    """
+    Update DNS record with new IP.
+
+    Args:
+        cloud: QcloudApiv3 instance
+        domain: Domain name
+        sub_domain: Subdomain name
+        record_id: Record ID to update
+        cf_ip: New IP address
+
+    Returns:
+        Status message
+    """
     try:
-        cloud.change_record(DOMAIN, record_id, SUB_DOMAIN, cf_ip, "A", "默认", 600)
-        print(f"change_dns success: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- ip：" + str(cf_ip))
-        return "ip:" + str(cf_ip) + "解析" + str(SUB_DOMAIN) + "." + str(DOMAIN) + "成功"
-
+        cloud.change_record(domain, record_id, sub_domain, cf_ip, "A", "默认", 600)
+        log_success("change_dns", cf_ip)
+        return f"ip:{cf_ip} 解析 {sub_domain}.{domain} 成功"
     except Exception as e:
         traceback.print_exc()
-        print(f"change_dns ERROR: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- MESSAGE: " + str(e))
-        return "ip:" + str(cf_ip) + "解析" + str(SUB_DOMAIN) + "." + str(DOMAIN) + "失败"
+        log_error("change_dns", str(e))
+        return f"ip:{cf_ip} 解析 {sub_domain}.{domain} 失败"
 
 
-def pushplus(content):
-    url = 'http://www.pushplus.plus/send'
-    data = {
-        "token": PUSHPLUS_TOKEN,
-        "title": "IP优选DNSPOD推送",
-        "content": content,
-        "template": "markdown",
-        "channel": "wechat"
-    }
-    body = json.dumps(data).encode(encoding='utf-8')
-    headers = {'Content-Type': 'application/json'}
-    requests.post(url, data=body, headers=headers)
+def main() -> None:
+    """Main entry point."""
+    # Load configuration
+    domain = get_env_var("DOMAIN")
+    sub_domain = get_env_var("SUB_DOMAIN")
+    secret_id = get_env_var("SECRETID")
+    secret_key = get_env_var("SECRETKEY")
+    pushplus_token = get_env_var("PUSHPLUS_TOKEN")
 
+    # Initialize DNSPod client
+    cloud = QcloudApiv3(secret_id, secret_key)
 
-if __name__ == '__main__':
-    # 构造环境
-    cloud = QcloudApiv3(SECRETID, SECRETKEY)
+    # Get existing DNS records
+    dns_info = build_dns_info(cloud, domain, sub_domain)
+    if not dns_info:
+        log_error("build_dns_info", f"No DNS records found for {sub_domain}.{domain}")
+        return
 
-    # 获取DNS记录
-    info = build_info(cloud)
-
-    # 获取最新优选IP
+    # Fetch latest optimized IPs
     ip_addresses_str = get_cf_speed_test_ip()
-    ip_addresses = ip_addresses_str.split(',')
+    if not ip_addresses_str:
+        log_error("get_cf_speed_test_ip", "Failed to fetch IP addresses")
+        return
 
+    ip_addresses = [ip.strip() for ip in ip_addresses_str.split(",") if ip.strip()]
+    if not ip_addresses:
+        log_error("parse_ip_addresses", "No valid IP addresses found")
+        return
+
+    # Update DNS records and collect results
     pushplus_content = []
-    # 遍历 IP 地址列表
     for index, ip_address in enumerate(ip_addresses):
-        # 执行 DNS 变更
-        dns = change_dns(cloud, info[index]["recordId"], ip_address)
-        pushplus_content.append(dns)
+        if index >= len(dns_info):
+            break
+        result = change_dns(
+            cloud,
+            domain,
+            sub_domain,
+            dns_info[index]["recordId"],
+            ip_address
+        )
+        pushplus_content.append(result)
 
-    pushplus('\n'.join(pushplus_content))
+    # Send notification
+    if pushplus_content:
+        pushplus_send(pushplus_token, "IP优选DNSPOD推送", "\n".join(pushplus_content))
+
+
+if __name__ == "__main__":
+    main()
